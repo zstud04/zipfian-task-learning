@@ -1,0 +1,82 @@
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path.cwd().parent))
+
+import torch
+
+from core.toy_transformer import ToyTransformer
+from core.number_line import NumberLine
+
+
+def right_of(a, b):
+    return a > b
+
+
+d_task = 100
+n_train = 2000
+batch_size = 64
+epochs = 5
+lr = 3e-4
+n_eval = 2000
+model_seed = 0
+
+n_new_items = 5
+n_new_train = 1000
+new_epochs = 5
+
+alphas = [0.0, 0.5, 1.0, 1.5, 2.0]
+
+torch.manual_seed(model_seed)
+model = ToyTransformer("qwen2", d_model=128, n_layers=3, n_heads=4, n_ctx=64)
+
+results = {}
+for k, alpha in enumerate(alphas):
+    line = NumberLine(d=d_task, alpha=alpha, distinct_operands=True, seed=k)
+    line.add_operator_token("RIGHT_OF", right_of, arity=2)
+
+    torch.manual_seed(model_seed)
+    model.reset()
+    model.add_task("numberline", tokens=line.vocab, alpha=alpha)
+
+    eval_data = model.get_eval_set(line, n_eval)
+
+    line.reset_counts()
+    model.fit(line.training_instances(n_train), epochs=epochs, batch_size=batch_size, lr=lr)
+    base_acc = model.accuracy(eval_data)
+    seen = sum(1 for t in line.items if line.token_counts[t] > 0)
+
+    new_items = line.add_new_item_token(
+        [f"new{i}" for i in range(n_new_items)], ranks=list(range(n_new_items))
+    )
+    model.add_tokens(new_items)
+
+    new_seqs = []
+    while len(new_seqs) < n_new_train:
+        seq = line.make_instance("RIGHT_OF", distinct=True)
+        if seq[1] in new_items or seq[2] in new_items:
+            new_seqs.append(seq)
+    new_eval = [
+        s
+        for s in line.training_instances(n_eval)
+        if s[1] in new_items or s[2] in new_items
+    ]
+
+    before = model.accuracy(new_eval)
+    model.fit(new_seqs, epochs=new_epochs, batch_size=batch_size, lr=lr)
+    after = model.accuracy(new_eval)
+    retention = model.accuracy(eval_data)
+
+    results[alpha] = (base_acc, seen, before, after, retention)
+    print(
+        f"alpha {alpha:<4} base {base_acc:.3f}  seen {seen}/{d_task}  "
+        f"new before {before:.3f}  new after {after:.3f}  retention {retention:.3f}"
+    )
+
+print()
+print("alpha  base   seen  new_before  new_after  retention")
+for alpha, (base_acc, seen, before, after, retention) in results.items():
+    print(
+        f"{alpha:<6} {base_acc:.3f}  {seen:<4}  {before:.3f}       "
+        f"{after:.3f}      {retention:.3f}"
+    )

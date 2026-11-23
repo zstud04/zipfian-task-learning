@@ -91,6 +91,22 @@ class ToyTransformer(nn.Module):
     def device(self) -> torch.device:
         return self.model.device
 
+    @property
+    def dtype(self) -> torch.dtype:
+        return next(self.model.parameters()).dtype
+
+    def reset(self) -> None:
+        device, dtype = self.device, self.dtype
+        self.config.vocab_size = 0
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Initializing zero-element")
+            model = AutoModelForCausalLM.from_config(self.config)
+        self.model = model.to(device=device, dtype=dtype)
+        self.token_to_id = {}
+        self.id_to_token = []
+        self.tasks = {}
+        self.zero_grad(set_to_none=True)
+
     def tokenize(self, tokens: Sequence[str], batched: bool = True) -> torch.Tensor:
         try:
             ids = [self.token_to_id[t] for t in tokens]
@@ -102,6 +118,55 @@ class ToyTransformer(nn.Module):
     def detokenize(self, ids: Iterable[int]) -> list[str]:
         return [self.id_to_token[int(i)] for i in ids]
 
+    def get_token_from_pos(self, pos: int) -> str:
+        if not -self.vocab_size <= pos < self.vocab_size:
+            raise IndexError(
+                f"position {pos} is outside the vocabulary [0, {self.vocab_size})"
+            )
+        return self.id_to_token[pos]
+
+    def get_pos_from_token(self, token: str) -> int:
+        try:
+            return self.token_to_id[token]
+        except KeyError:
+            raise KeyError(f"token {token!r} is not in the vocabulary") from None
+
+    def add_tokens(self, tokens: Sequence[str]) -> list[int]:
+        return self._grow_vocab(list(tokens))
+
+    def get_eval_set(
+        self,
+        line,
+        n_eval: int,
+        uniform: bool = True,
+        distinct: bool = True,
+        seed: int = 999,
+    ) -> torch.Tensor:
+        from core.number_line import NumberLine
+
+        if uniform:
+            source = NumberLine(
+                d=line.d,
+                alpha=0.0,
+                item_names=line.items,
+                distinct_operands=distinct,
+                seed=seed,
+            )
+            for name, op in line.operators.items():
+                extras = {
+                    k: v
+                    for k, v in op.items()
+                    if k not in ("name", "fn", "arity", "weight")
+                }
+                source.add_operator_token(
+                    name, op["fn"], arity=op["arity"], weight=op["weight"], **extras
+                )
+        else:
+            source = line
+
+        seqs = source.training_instances(n_eval, distinct=distinct)
+        return torch.stack([self.tokenize(s, batched=False) for s in seqs])
+
     def _grow_vocab(self, tokens: Sequence[str]) -> list[int]:
         fresh = [t for t in dict.fromkeys(tokens) if t not in self.token_to_id]
         if fresh:
@@ -109,6 +174,7 @@ class ToyTransformer(nn.Module):
                 self.token_to_id[tok] = len(self.id_to_token)
                 self.id_to_token.append(tok)
             self.model.resize_token_embeddings(self.vocab_size, mean_resizing=False)
+            self.zero_grad(set_to_none=True)
             with torch.no_grad():
                 matrices = [self.model.get_input_embeddings().weight]
                 if not self.config.tie_word_embeddings:
@@ -153,6 +219,46 @@ class ToyTransformer(nn.Module):
             tokens = torch.cat([tokens, nxt], dim=-1)
         self.train(was_training)
         return tokens
+
+    def as_tensor(self, instances) -> torch.Tensor:
+        if isinstance(instances, torch.Tensor):
+            return instances.to(self.device)
+        return torch.stack([self.tokenize(s, batched=False) for s in instances])
+
+    def fit(
+        self,
+        instances,
+        epochs: int = 5,
+        batch_size: int = 64,
+        lr: float = 3e-4,
+        verbose: bool = False,
+    ) -> list[float]:
+        data = self.as_tensor(instances)
+        opt = torch.optim.AdamW(self.parameters(), lr=lr)
+        history = []
+        self.train()
+        for epoch in range(epochs):
+            perm = torch.randperm(len(data), device=data.device)
+            total, n_seen = 0.0, 0
+            for i in range(0, len(data), batch_size):
+                batch = data[perm[i : i + batch_size]]
+                loss = self.loss(batch)
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                total += loss.item() * len(batch)
+                n_seen += len(batch)
+            history.append(total / n_seen)
+            if verbose:
+                print(f"epoch {epoch + 1}/{epochs}  loss {history[-1]:.4f}")
+        return history
+
+    def accuracy(self, instances) -> float:
+        data = self.as_tensor(instances)
+        self.eval()
+        with torch.no_grad():
+            pred = self(data)[:, -2].argmax(dim=-1)
+        return (pred == data[:, -1]).float().mean().item()
 
     def add_task(self, name: str, tokens: Sequence[str], **metadata) -> dict:
         if name in self.tasks:
